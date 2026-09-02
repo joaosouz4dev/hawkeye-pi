@@ -1,0 +1,19 @@
+# hawkeye-pi - configuracao local
+# Copie este arquivo como `config.local.yaml` e preencha com os dados da SUA camera.
+# `config.local.yaml` esta no .gitignore - suas credenciais NAO vao pro repo.
+#
+# Formato: chave: valor (uma por linha, sem aspas obrigatorias)
+# Alternativa: definir como variavel de ambiente em MAIUSCULAS (ex: CAM_HOST=192.168.1.100)
+
+# --- ONVIF PTZ (endereco da camera na rede local) ---
+cam_host: 192.168.1.100        # IP da camera
+cam_port: 5000                 # porta ONVIF (Yoosee/Xiongmai = 5000)
+cam_user: admin                # usuario ONVIF
+cam_pass: TROQUE_ISSO          # senha ONVIF
+cam_profile: IPCProfilesToken0 # profile token; descubra via GetProfiles se nao for esse
+cam_label: Garagem             # nome amigavel exibido na UI
+
+# --- Servidor web (interface controle) ---
+listen_port: 1985
+go2rtc_url: http://localhost:1984
+stream_name: garagem_web       # nome do stream no go2rtc.yaml (transcodado H.264 pra MSE)

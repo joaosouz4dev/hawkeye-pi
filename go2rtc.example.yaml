@@ -1,0 +1,34 @@
+# hawkeye-pi - config do go2rtc (exemplo publico)
+# Copie como `go2rtc.yaml` e preencha com o IP/senha da SUA camera.
+# Formato de URL RTSP: rtsp://USUARIO:SENHA@IP_DA_CAMERA:554/CAMINHO
+# Para Yoosee/Xiongmai, o caminho e /onvif1 (main H.265) e /onvif2 (sub).
+
+streams:
+  # Stream principal (H.265 nativo da camera - alta qualidade, funciona em WebRTC)
+  garagem:
+    - "rtsp://USUARIO:SENHA@IP_DA_CAMERA:554/onvif1#rtptransport=udp"
+    - "ffmpeg:garagem#video=h264#hardware"   # fallback transcodado
+  # Sub-stream (H.265 baixa resolucao)
+  garagem_sub:
+    - "rtsp://USUARIO:SENHA@IP_DA_CAMERA:554/onvif2#rtptransport=udp"
+  # Stream H.264 dedicado para o player web (Chromium/Safari nao decodificam H.265 em MSE).
+  # E o que a interface hawkeye-pi consome. Nao remover se voce for usar a UI web.
+  garagem_web:
+    - "ffmpeg:garagem#video=h264#hardware"
+
+# Caminho do ffmpeg. Windows com scoop: C:/Users/SEU_USUARIO/scoop/shims/ffmpeg.exe
+# Linux/Mac: geralmente basta "ffmpeg" no PATH (pode omitir esta secao inteira).
+ffmpeg:
+  bin: "ffmpeg"
+
+api:
+  listen: ":1984"
+  origin: "*"   # necessario porque o painel web roda em outra porta (1985)
+
+rtsp:
+  listen: ":8554"
+
+# WebRTC: substitua pelo IP LOCAL do PC (nao 127.0.0.1) para o navegador conectar.
+webrtc:
+  candidates:
+    - 192.168.1.10:8555

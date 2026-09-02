@@ -1,0 +1,20 @@
+# Credenciais e config local
+config.local.yaml
+go2rtc.yaml
+!go2rtc.example.yaml
+!config.example.yaml
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Snapshots/gravacoes gerados
+snapshots/
+recordings/
+presets/
+snap.jpg
+_live.jpg
+*.webm

@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+Controle PTZ web para camera Yoosee.
+
+Interface imersiva em http://localhost:1985:
+ - Video edge-to-edge com overlays flutuantes
+ - Auto-hide dos overlays apos 3s sem interacao (estilo Netflix)
+ - D-pad compacto no canto inferior direito
+ - Coluna de acoes a esquerda: snapshot, rec-clipe, fullscreen, som
+ - Header com estado REAL do stream (LIVE / RECONECTANDO / OFFLINE) + latencia
+ - Instant replay: buffer dos ultimos ~30s scrubbable
+ - Responsivo: funciona bem em celular e desktop
+
+Nao tem microfone/backchannel: testado exaustivamente,
+o firmware nao aceita RTSP ANNOUNCE (405) nem ONVIF audio (0 bytes).
+"""
+import socket
+import hashlib
+import base64
+import os
+import json
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---- Config: carrega config.local.yaml (fora do git) ou usa defaults ----
+# O YAML e um subset simples (chave: valor por linha, strings sem aspas ou entre aspas).
+# Sem dependencia externa (pyyaml nao vem no stdlib).
+def _load_local_config():
+    path = os.path.join(BASE_DIR, "config.local.yaml")
+    cfg = {}
+    if not os.path.exists(path):
+        return cfg
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if not line or ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                v = v.strip().strip('"').strip("'")
+                cfg[k.strip()] = v
+    except Exception as e:
+        print(f"[config.local.yaml] erro ao ler: {e}")
+    return cfg
+
+_cfg = _load_local_config()
+def _c(key, default):
+    return os.environ.get(key.upper(), _cfg.get(key, default))
+
+# ---- Config da camera (ONVIF) ----
+CAM_HOST = _c("cam_host", "192.168.1.100")   # trocar em config.local.yaml
+CAM_PORT = int(_c("cam_port", "5000"))
+CAM_USER = _c("cam_user", "admin")
+CAM_PASS = _c("cam_pass", "")                # SEM DEFAULT em codigo publico
+PROFILE  = _c("cam_profile", "IPCProfilesToken0")
+PTZ_PATH = "/onvif/ptz_service"
+
+# ---- Servidor web local ----
+LISTEN_PORT = int(_c("listen_port", "1985"))
+GO2RTC_URL  = _c("go2rtc_url", "http://localhost:1984")
+STREAM_NAME = _c("stream_name", "garagem_web")
+CAM_LABEL   = _c("cam_label", "Camera")
+
+if not CAM_PASS:
+    print("[AVISO] CAM_PASS vazio. Crie config.local.yaml a partir de config.example.yaml.")
+
+
+# ============================================================
+# ONVIF PTZ
+# ============================================================
+
+def _wss_header():
+    nonce = os.urandom(16)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode() + CAM_PASS.encode()).digest()
+    ).decode()
+    n64 = base64.b64encode(nonce).decode()
+    return (
+        '<s:Header><Security s:mustUnderstand="1" '
+        'xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
+        f'<UsernameToken><Username>{CAM_USER}</Username>'
+        '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</Password>'
+        '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{n64}</Nonce>'
+        '<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        f'{created}</Created>'
+        '</UsernameToken></Security></s:Header>'
+    )
+
+
+def _soap(action, inner):
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        f'{_wss_header()}<s:Body>{inner}</s:Body></s:Envelope>'
+    )
+    req = (
+        f"POST {PTZ_PATH} HTTP/1.1\r\nHost: {CAM_HOST}:{CAM_PORT}\r\n"
+        f'Content-Type: application/soap+xml; charset=utf-8; action="{action}"\r\n'
+        f"Content-Length: {len(body.encode())}\r\nConnection: close\r\n\r\n{body}"
+    )
+    try:
+        s = socket.create_connection((CAM_HOST, CAM_PORT), timeout=6)
+        s.sendall(req.encode())
+        data = s.recv(2048)
+        s.close()
+        if not data:
+            return True, "OK (sem corpo)"
+        status = data.decode(errors="replace").split("\r\n")[0]
+        return status.endswith("200 OK"), status
+    except Exception as e:
+        return False, f"ERRO: {e}"
+
+
+def ptz_move(x, y):
+    ns = "http://www.onvif.org/ver20/ptz/wsdl"
+    sch = "http://www.onvif.org/ver10/schema"
+    inner = (
+        f'<ContinuousMove xmlns="{ns}"><ProfileToken>{PROFILE}</ProfileToken>'
+        f'<Velocity><PanTilt x="{x}" y="{y}" xmlns="{sch}"/></Velocity></ContinuousMove>'
+    )
+    return _soap(f"{ns}/ContinuousMove", inner)
+
+
+def ptz_stop():
+    ns = "http://www.onvif.org/ver20/ptz/wsdl"
+    inner = (
+        f'<Stop xmlns="{ns}"><ProfileToken>{PROFILE}</ProfileToken>'
+        f'<PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>'
+    )
+    return _soap(f"{ns}/Stop", inner)
+
+
+DIRECTIONS = {
+    "up":    (0.0,  0.6),
+    "down":  (0.0, -0.6),
+    "left":  (-0.6, 0.0),
+    "right": (0.6,  0.0),
+    "upleft":    (-0.6,  0.6),
+    "upright":   (0.6,   0.6),
+    "downleft":  (-0.6, -0.6),
+    "downright": (0.6,  -0.6),
+}
+
+
+# ============================================================
+# HTML da pagina (layout imersivo)
+# ============================================================
+
+PAGE = r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="hawkeye">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<title>__LABEL__ — hawkeye-pi</title>
+<style>
+  :root { color-scheme: dark; --safe-t: env(safe-area-inset-top, 0px);
+          --safe-r: env(safe-area-inset-right, 0px);
+          --safe-b: env(safe-area-inset-bottom, 0px);
+          --safe-l: env(safe-area-inset-left, 0px); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; padding:0; height:100%; background:#000; overflow:hidden;
+               font-family: system-ui, -apple-system, sans-serif; color:#fff; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+           background:#000; }
+  #stage video-stream, #stage video { display:block; width:100%; height:100%;
+                                       object-fit:contain; background:#000; }
+  /* esconde qualquer controle nativo do <video> - usamos nossos overlays */
+  #stage video::-webkit-media-controls,
+  #stage video::-webkit-media-controls-enclosure,
+  #stage video::-webkit-media-controls-panel { display:none !important; }
+  #stage video { pointer-events:none; } /* evita clique no video acionar play/pause */
+
+  /* --- overlays --- */
+  .overlay { position:fixed; z-index:5; transition:opacity .25s ease; }
+  .hidden .overlay { opacity:0; pointer-events:none; }
+
+  /* Header (topo) */
+  .top { top:calc(12px + var(--safe-t)); left:calc(12px + var(--safe-l));
+         right:calc(12px + var(--safe-r));
+         display:flex; align-items:center; gap:10px; pointer-events:none; }
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:6px 10px;
+           font-size:.75rem; font-weight:600; letter-spacing:.5px;
+           background:rgba(0,0,0,.55); backdrop-filter:blur(10px);
+           border-radius:999px; border:1px solid rgba(255,255,255,.08);
+           pointer-events:auto; }
+  .badge .dot { width:8px; height:8px; border-radius:50%; background:#22c55e;
+                box-shadow:0 0 0 0 rgba(34,197,94,.6); animation:pulse 1.6s infinite; }
+  .badge.warn .dot { background:#f59e0b; }
+  .badge.err  .dot { background:#ef4444; animation:none; }
+  .badge.replay .dot { background:#facc15; animation:none; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(34,197,94,.6);} 70%{box-shadow:0 0 0 8px rgba(34,197,94,0);} 100%{box-shadow:0 0 0 0 rgba(34,197,94,0);} }
+  .cam-name { flex:1; text-align:center; font-size:.9rem; font-weight:600;
+              text-shadow:0 1px 3px rgba(0,0,0,.7); pointer-events:none; }
+  .meta { font-size:.7rem; color:#cbd0d9; padding:6px 10px;
+          background:rgba(0,0,0,.55); backdrop-filter:blur(10px);
+          border-radius:999px; border:1px solid rgba(255,255,255,.08); }
+
+  /* Coluna esquerda: acoes */
+  .actions { top:50%; left:calc(12px + var(--safe-l)); transform:translateY(-50%);
+             display:flex; flex-direction:column; gap:10px; }
+  .actions button, .dpad button, .replay button {
+    width:44px; height:44px; border-radius:50%; border:1px solid rgba(255,255,255,.12);
+    background:rgba(0,0,0,.55); backdrop-filter:blur(10px); color:#fff; cursor:pointer;
+    display:inline-flex; align-items:center; justify-content:center;
+    font-size:1rem; transition:transform .1s, background .15s, border-color .15s; }
+  .actions button:hover, .dpad button:hover, .replay button:hover {
+    background:rgba(59,130,246,.25); border-color:#3b82f6; }
+  .actions button:active, .dpad button:active { transform:scale(.9); }
+  .actions button.recording { background:rgba(239,68,68,.35); border-color:#ef4444;
+                              animation:pulse-rec 1s infinite; }
+  @keyframes pulse-rec { 50%{background:rgba(239,68,68,.6);} }
+
+  /* D-pad canto inferior direito */
+  .dpad { bottom:calc(16px + var(--safe-b)); right:calc(16px + var(--safe-r));
+          display:grid; grid-template-columns:repeat(3,44px); grid-template-rows:repeat(3,44px);
+          gap:4px; touch-action:none; }
+  .dpad .center { background:transparent; border:none; cursor:default; pointer-events:none; }
+  .dpad button.on { background:#3b82f6; border-color:#3b82f6; }
+
+  /* Barra de instant replay (base) */
+  .replay { left:50%; bottom:calc(16px + var(--safe-b)); transform:translateX(-50%);
+            display:flex; align-items:center; gap:10px;
+            padding:8px 12px; background:rgba(0,0,0,.55); backdrop-filter:blur(10px);
+            border-radius:999px; border:1px solid rgba(255,255,255,.08); }
+  .replay .bar { position:relative; width:min(45vw,340px); height:6px; background:rgba(255,255,255,.12);
+                 border-radius:3px; cursor:pointer; overflow:hidden; }
+  .replay .buf { position:absolute; top:0; left:0; height:100%; background:rgba(255,255,255,.25); }
+  .replay .knob { position:absolute; top:50%; transform:translate(-50%,-50%); width:14px; height:14px;
+                  border-radius:50%; background:#fff; box-shadow:0 0 0 3px rgba(255,255,255,.2); }
+  .replay .time { font-size:.72rem; color:#e2e8f0; font-variant-numeric:tabular-nums; min-width:34px; text-align:center; }
+  .replay button { width:36px; height:36px; font-size:.72rem; font-weight:600; }
+  .replay button.live { background:#22c55e; border-color:#22c55e; color:#000; }
+
+  /* Toast de feedback */
+  #toast { position:fixed; top:64px; left:50%; transform:translateX(-50%);
+           background:rgba(0,0,0,.75); backdrop-filter:blur(10px);
+           padding:8px 14px; border-radius:999px; font-size:.8rem;
+           border:1px solid rgba(255,255,255,.1); opacity:0; transition:opacity .2s;
+           z-index:10; pointer-events:none; }
+  #toast.show { opacity:1; }
+
+  /* Mobile: aumenta os botoes para o dedo */
+  @media (max-width: 640px) {
+    .actions button, .replay button { width:48px; height:48px; }
+    .dpad { grid-template-columns:repeat(3,52px); grid-template-rows:repeat(3,52px); gap:5px; }
+    .dpad button { width:52px; height:52px; font-size:1.15rem; }
+    .replay .bar { width:min(50vw,260px); }
+  }
+  /* Landscape mobile: puxa d-pad pra baixo-direita menos invasivo */
+  @media (max-width: 900px) and (orientation: landscape) {
+    .replay { bottom:calc(72px + var(--safe-b)); }
+  }
+</style></head>
+<body class="hidden">
+  <div id="stage"><video-stream id="player"></video-stream></div>
+
+  <div class="overlay top">
+    <span id="badge" class="badge"><span class="dot"></span><span id="badge-text">conectando</span></span>
+    <span class="cam-name">__LABEL__</span>
+    <span class="meta" id="meta"><span id="clock">--:--:--</span></span>
+  </div>
+
+  <div class="overlay actions">
+    <button id="btn-snap" title="Snapshot (S)" aria-label="Snapshot">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+    </button>
+    <button id="btn-rec" title="Gravar 30s (R)" aria-label="Gravar clipe">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
+    </button>
+    <button id="btn-fs" title="Tela cheia (F)" aria-label="Tela cheia">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+    </button>
+    <button id="btn-sound" title="Som (M)" aria-label="Som">
+      <svg id="ico-mute" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+      <svg id="ico-sound" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+    </button>
+  </div>
+
+  <div class="overlay dpad">
+    <button data-dir="upleft">↖</button>
+    <button data-dir="up">↑</button>
+    <button data-dir="upright">↗</button>
+    <button data-dir="left">←</button>
+    <div class="center"></div>
+    <button data-dir="right">→</button>
+    <button data-dir="downleft">↙</button>
+    <button data-dir="down">↓</button>
+    <button data-dir="downright">↘</button>
+  </div>
+
+  <div class="overlay replay">
+    <button id="btn-back10" title="Voltar 10s">-10s</button>
+    <div class="bar" id="bar"><div class="buf" id="buf"></div><div class="knob" id="knob"></div></div>
+    <span class="time" id="pos">-0s</span>
+    <button id="btn-live" class="live" title="Ao vivo">LIVE</button>
+  </div>
+
+  <div id="toast"></div>
+
+<script type="module">
+import './video-stream-muted.js';
+const player = document.getElementById('player');
+// MSE forcado: WebRTC nao expoe buffer/seekable (impede o instant replay)
+player.mode = 'mse';
+player.src = '__GO2RTC__/api/ws?src=__STREAM__';
+window.__player = player;
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const player = () => window.__player;
+const video = () => { const p=player(); return p ? p.querySelector('video') : null; };
+const toast = (msg, ms=1800) => { const t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('show'), ms); };
+
+// ---- auto-hide overlays ----
+let hideTimer = null;
+function showControls(){ document.body.classList.remove('hidden'); clearTimeout(hideTimer); hideTimer = setTimeout(()=>document.body.classList.add('hidden'), 3000); }
+['mousemove','mousedown','touchstart','keydown'].forEach(ev => window.addEventListener(ev, showControls, {passive:true}));
+showControls();
+
+// ---- clock ----
+setInterval(()=>{
+  const d=new Date(); const pad=n=>String(n).padStart(2,'0');
+  $('clock').textContent = pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+}, 500);
+
+// ---- estado do stream (LIVE / RECONECTANDO / OFFLINE) ----
+let lastState = '';
+function setBadge(state, text){
+  const b=$('badge'); b.classList.remove('warn','err','replay');
+  if(state==='warn') b.classList.add('warn');
+  if(state==='err')  b.classList.add('err');
+  if(state==='replay') b.classList.add('replay');
+  $('badge-text').textContent = text;
+}
+setBadge('warn','conectando');
+// controle honesto: quando um frame chega, marca timestamp; se ficar mais de 3s sem frame novo, considera "sem stream"
+let lastFrameAt = 0, lastCurTime = -1;
+setInterval(()=>{
+  const v = video();
+  if(!v) return;
+  if(v.currentTime !== lastCurTime){ lastFrameAt = performance.now(); lastCurTime = v.currentTime; }
+  // auto-recuperacao: se o currentTime estiver FORA do buffer, pula pro live
+  if(v.buffered.length){
+    const bufEnd = v.buffered.end(v.buffered.length - 1);
+    const bufStart = v.buffered.start(0);
+    if(v.currentTime < bufStart - 1 || v.currentTime > bufEnd + 1){
+      v.currentTime = bufEnd - 0.1;
+    }
+  }
+  // se pausado sem motivo (chrome autoplay policy), tenta destravar
+  if(v.paused && v.readyState >= 2){ v.play().catch(()=>{}); }
+}, 500);
+function updateStreamState(){
+  const v = video();
+  if(!v || v.readyState < 2){ setBadge('warn','conectando'); return; }
+  const stale = performance.now() - lastFrameAt > 3500;
+  if(stale){ setBadge('warn','reconectando'); return; }
+  if(v.paused){ setBadge('warn','pausado'); return; }
+  if(!isNearLive()){ setBadge('replay','replay'); return; }
+  setBadge('ok','ao vivo');
+}
+setInterval(updateStreamState, 800);
+
+// ---- som ----
+function refreshSoundIcon(){
+  const p=player(), muted = p && p.isMuted && p.isMuted();
+  $('ico-mute').style.display = muted ? '' : 'none';
+  $('ico-sound').style.display = muted ? 'none' : '';
+}
+$('btn-sound').addEventListener('click', ()=>{ const p=player(); if(!p) return; p.setMuted(!p.isMuted()); refreshSoundIcon(); toast(p.isMuted()?'mudo':'som ligado'); });
+setInterval(refreshSoundIcon, 500);
+
+// ---- snapshot ----
+$('btn-snap').addEventListener('click', async ()=>{
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+    const a = document.createElement('a');
+    a.href = '__GO2RTC__/api/frame.jpeg?src=__STREAM__&_='+Date.now();
+    a.download = `garagem_${ts}.jpg`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('foto baixada');
+  } catch(e){ toast('erro no snapshot'); }
+});
+
+// ---- fullscreen ----
+$('btn-fs').addEventListener('click', async ()=>{
+  try {
+    if(document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch(e){ toast('fullscreen indisponivel'); }
+});
+
+// ---- rec-clipe (MediaRecorder no cliente) ----
+let recorder = null;
+$('btn-rec').addEventListener('click', async ()=>{
+  const btn = $('btn-rec');
+  if(recorder && recorder.state !== 'inactive'){ recorder.stop(); return; }
+  const v = video();
+  if(!v || v.readyState < 2){ toast('sem video ainda'); return; }
+  try {
+    const stream = v.captureStream ? v.captureStream() : v.mozCaptureStream();
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+               : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8'
+               : 'video/webm';
+    recorder = new MediaRecorder(stream, {mimeType: mime});
+    const chunks = [];
+    recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+    recorder.onstop = ()=>{
+      const blob = new Blob(chunks, {type:'video/webm'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+      a.href = url; a.download = `garagem_${ts}.webm`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 5000);
+      btn.classList.remove('recording');
+      toast('clipe salvo');
+    };
+    recorder.start();
+    btn.classList.add('recording');
+    toast('gravando 30s...');
+    setTimeout(()=>{ if(recorder && recorder.state==='recording') recorder.stop(); }, 30000);
+  } catch(e){ toast('erro ao gravar: '+e.message); }
+});
+
+// ---- d-pad ----
+let moving = false;
+async function apiPost(path){ try { return await (await fetch(path,{method:'POST'})).json(); } catch(e){ return {ok:false}; } }
+function startMove(dir){ if(moving) return; moving=true; apiPost('/move/'+dir); }
+function stop(){ if(!moving) return; moving=false; apiPost('/stop'); }
+document.querySelectorAll('.dpad button[data-dir]').forEach(b=>{
+  const dir = b.dataset.dir;
+  const down = e=>{ e.preventDefault(); b.classList.add('on'); showControls(); startMove(dir); };
+  const up   = e=>{ e.preventDefault(); b.classList.remove('on'); stop(); };
+  b.addEventListener('mousedown', down);
+  b.addEventListener('touchstart', down, {passive:false});
+  b.addEventListener('mouseup', up);
+  b.addEventListener('mouseleave', up);
+  b.addEventListener('touchend', up);
+  b.addEventListener('touchcancel', up);
+});
+const KEYMAP = {ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right'};
+const HOTKEYS = {'s':'btn-snap','S':'btn-snap','r':'btn-rec','R':'btn-rec','f':'btn-fs','F':'btn-fs','m':'btn-sound','M':'btn-sound'};
+window.addEventListener('keydown', e=>{
+  if(KEYMAP[e.key] && !e.repeat){ e.preventDefault(); startMove(KEYMAP[e.key]); return; }
+  if(HOTKEYS[e.key]){ e.preventDefault(); $(HOTKEYS[e.key]).click(); }
+});
+window.addEventListener('keyup', e=>{ if(KEYMAP[e.key]){ e.preventDefault(); stop(); }});
+window.addEventListener('blur', stop);
+
+// ---- instant replay ----
+function bufferedRange(){
+  const v = video();
+  if(!v || !v.buffered.length) return null;
+  const i = v.buffered.length - 1;
+  return { start: v.buffered.start(i), end: v.buffered.end(i) };
+}
+function isNearLive(){
+  const v = video(); const b = bufferedRange();
+  if(!v || !b) return true;
+  return (b.end - v.currentTime) < 1.5;
+}
+function fmtOffset(sec){ if(sec >= -1) return 'AO VIVO'; const s = Math.round(-sec); return '-'+s+'s'; }
+function updateReplay(){
+  const v = video(); const b = bufferedRange();
+  if(!v || !b){ $('buf').style.width='0%'; $('knob').style.left='100%'; $('pos').textContent='--'; return; }
+  const total = Math.max(1, b.end - b.start);
+  const posInBuf = Math.max(0, Math.min(1, (v.currentTime - b.start) / total));
+  $('buf').style.width = '100%';
+  $('knob').style.left = (posInBuf*100)+'%';
+  $('pos').textContent = fmtOffset(v.currentTime - b.end);
+  $('btn-live').style.display = isNearLive() ? 'none' : '';
+}
+setInterval(updateReplay, 250);
+$('bar').addEventListener('click', e=>{
+  const v = video(); const b = bufferedRange();
+  if(!v || !b) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  v.currentTime = b.start + frac * (b.end - b.start);
+});
+$('btn-back10').addEventListener('click', ()=>{
+  const v = video(); const b = bufferedRange();
+  if(!v || !b) return;
+  v.currentTime = Math.max(b.start, v.currentTime - 10);
+});
+$('btn-live').addEventListener('click', ()=>{
+  const v = video(); const b = bufferedRange();
+  if(!v || !b) return;
+  v.currentTime = Math.max(b.start, b.end - 0.1);
+});
+
+// --- PWA: registrar service worker (permite instalar como app) ---
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.warn('SW:', err));
+  });
+}
+</script>
+</body></html>
+"""
+
+
+# ============================================================
+# HTTP handler
+# ============================================================
+
+STATIC_FILES = {
+    "/video-stream-muted.js": ("video-stream-muted.js", "text/javascript; charset=utf-8"),
+    "/video-rtc.js":          ("video-rtc.js",          "text/javascript; charset=utf-8"),
+    "/manifest.webmanifest":  ("manifest.webmanifest",  "application/manifest+json; charset=utf-8"),
+    "/sw.js":                 ("sw.js",                 "text/javascript; charset=utf-8"),
+    "/icon-192.png":          ("icon-192.png",          "image/png"),
+    "/icon-512.png":          ("icon-512.png",          "image/png"),
+    "/icon-mask.png":         ("icon-mask.png",         "image/png"),
+    "/favicon.png":           ("favicon.png",           "image/png"),
+    "/favicon.ico":           ("favicon.png",           "image/png"),
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, obj, code=200):
+        payload = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if self.path == "/" or self.path.startswith("/index"):
+            html = (PAGE
+                .replace("__GO2RTC__", GO2RTC_URL)
+                .replace("__STREAM__", STREAM_NAME)
+                .replace("__LABEL__", CAM_LABEL)
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        elif path in STATIC_FILES:
+            fname, mime = STATIC_FILES[path]
+            fpath = os.path.join(BASE_DIR, fname)
+            try:
+                with open(fpath, "rb") as f:
+                    body = f.read()
+            except OSError:
+                self.send_error(404); return
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(body)))
+            # cache leve para assets estaticos, exceto sw.js (que precisa ser sempre fresco)
+            if fname != "sw.js":
+                self.send_header("Cache-Control", "public, max-age=3600")
+            else:
+                self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        p = self.path.strip("/").split("/")
+        if p[0] == "move" and len(p) == 2 and p[1] in DIRECTIONS:
+            x, y = DIRECTIONS[p[1]]
+            ok, st = ptz_move(x, y); self._json({"ok": ok, "status": st})
+        elif p[0] == "stop":
+            ok, st = ptz_stop(); self._json({"ok": ok, "status": st})
+        else:
+            self.send_error(404)
+
+    def log_message(self, *a): pass
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), Handler)
+    print(f"Controle PTZ em http://localhost:{LISTEN_PORT}")
+    srv.serve_forever()
