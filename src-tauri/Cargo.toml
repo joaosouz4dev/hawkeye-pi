@@ -1,0 +1,40 @@
+[package]
+name = "hawkeye-pi"
+version = "0.2.0"
+description = "Interface nativa para camera Yoosee via ONVIF + go2rtc"
+authors = ["João Victor Souza"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.75"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+chrono = "0.4"
+dirs = "5"
+
+[features]
+# by default Tauri runs in production mode
+# when `tauri dev` runs it is executed with `cargo run --no-default-features` if `devPath` is an URL
+default = ["custom-protocol"]
+# this feature is used for production builds where `devPath` points to the filesystem and only for release builds.
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "z"    # menor tamanho
+lto = true
+codegen-units = 1
+strip = true

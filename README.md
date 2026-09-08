@@ -1,134 +1,140 @@
 # hawkeye-pi
 
-Interface web imersiva e leve para câmeras IP Yoosee / Xiongmai / Anyka, controle PTZ e streaming HD sem depender do app oficial nem da nuvem.
+Aplicativo Windows nativo para câmeras IP Yoosee / Xiongmai / Anyka. Ver, ouvir e girar a câmera sem depender do app oficial nem da nuvem chinesa.
 
-![banner](icon-512.png)
+<p align="center">
+  <img src="ui/icon-512.png" width="128" alt="hawkeye-pi">
+</p>
 
-Faz o que o app do fabricante faz de bom (ver, ouvir, girar) e mostra tudo no navegador do PC ou do celular. Instala como app (PWA). Roda 100% na sua rede local — o vídeo não passa pelos servidores do fabricante.
+<p align="center">
+  <a href="https://github.com/joaosouz4dev/hawkeye-pi/releases/latest">
+    <b>⬇️ Baixar a última versão</b>
+  </a>
+</p>
 
-## Por que existe
+## O que é
 
-Câmeras Yoosee (e as ~15 marcas white-label baseadas no SoC Anyka AK3918: Jortan, Kapbom, Basike, Dura Well, GNCC, TECKIN, LETSCEE, Hiseeu, ANRAN, Ctronics, GWIPC e outras) implementam ONVIF de forma **parcial**: só `ContinuousMove` e `Stop` respondem. `AbsoluteMove`, `SetPreset`, `GotoPreset`, `GetStatus`, backchannel de áudio — todos ignorados pelo firmware. E o app do fabricante conversa com a câmera por um protocolo P2P proprietário cifrado que roteia pela nuvem chinesa.
+Um app **nativo do Windows** que abre uma janela mostrando o vídeo ao vivo da sua câmera IP com:
 
-Este projeto pega o que **funciona** do ONVIF (movimento) e junta com o [go2rtc](https://github.com/AlexxIT/go2rtc) (que bridge RTSP → WebRTC/MSE) para entregar uma UI web moderna, offline-first, sem nuvem.
+- Streaming Full HD (H.264 transcodado do H.265 nativo)
+- Controle PTZ (mover a câmera em 8 direções)
+- Snapshot, gravação de clipe (30s), tela cheia, replay instantâneo dos últimos ~30s
+- Auto-hide dos controles estilo Netflix
+- Áudio bidirecional? **Não, veja "O que não tem" abaixo**
 
-## Features
-
-- **Streaming Full HD** ao vivo via MSE (H.264 transcodado do H.265 nativo)
-- **Auto-hide dos overlays** após 3s parados (estilo Netflix), reaparece ao mover mouse/tocar
-- **Controle PTZ** por d-pad de 8 direções (mouse, toque e teclas de seta)
-- **Snapshot** — baixa foto JPEG instantânea
-- **Rec-clipe** — grava 30 segundos como `.webm` no seu PC
-- **Fullscreen** nativo do navegador
-- **Instant replay** — barra que scrubs os últimos ~30s bufferizados
-- **Estado real de conexão** — badge "ao vivo" / "reconectando" / "replay" baseado em fluxo real de frames (não em WebSocket)
-- **PWA instalável** — vira app no PC (Chrome/Edge) ou home do celular
-- **Layout responsivo** — mobile portrait, mobile landscape e desktop
-- **Áudio** com botão de mudo (inicia mudo por padrão)
-- **Atalhos de teclado** — setas movem, `S` snapshot, `R` rec, `F` fullscreen, `M` mudo
-
-## O que NÃO tem (e por quê)
-
-- **Presets de posição** — Firmware desta família ignora `SetPreset`/`GotoPreset`/`AbsoluteMove`/`GetStatus`. Sem posição absoluta, presets só podem ser aproximados por tempo (frágeis) ou por visão computacional (frágeis com chuva/pouca luz). Testados exaustivamente, removidos por não serem confiáveis. Use presets pelo app oficial quando precisar.
-- **Microfone (falar pela câmera)** — Firmware retorna `405 Method Not Allowed` para RTSP `ANNOUNCE` e `0 bytes` para todos os métodos ONVIF de áudio bidirecional. Bloqueado deliberadamente. Só o app P2P do fabricante consegue.
-- **Zoom** — a câmera 360 tem lente fixa, o "360" é só o giro pan (não zoom óptico). `GetNodes` do ONVIF confirma: nenhum eixo de zoom.
-
-Essas ausências são limitações da câmera, não do projeto — verifique você mesmo antes de reclamar 😉
-
-## Arquitetura
-
-```
-┌─────────────┐   RTSP    ┌──────────┐   MSE/WebRTC   ┌──────────┐
-│ Câmera IP   │──────────▶│ go2rtc   │───────────────▶│ Navegador│
-│ (Yoosee)    │  UDP:554  │ :1984    │  ws (transcode)│  (PWA)   │
-└─────────────┘           └──────────┘                └──────────┘
-      ▲                                                     │
-      │ ONVIF ContinuousMove/Stop (TCP:5000)                │
-      │                    ┌──────────────┐  HTTP POST      │
-      └────────────────────│ptz_control.py│◀────────────────┘
-                           │ :1985 (Python│
-                           │  stdlib puro)│
-                           └──────────────┘
-```
-
-- **go2rtc** faz o trabalho pesado: bufferiza o RTSP, transcodifica H.265 → H.264 quando o navegador precisa (MSE), oferece WebRTC quando possível.
-- **ptz_control.py** é um servidor HTTP mínimo (só stdlib do Python) que:
-  1. Serve a UI (HTML/CSS/JS embutidos)
-  2. Recebe comandos `POST /move/<dir>` e `POST /stop` da UI
-  3. Traduz para SOAP ONVIF com WS-Security (UsernameToken PasswordDigest SHA-1) e envia para a câmera
-- **PWA** — manifest + service worker mínimo. Sem cache offline (não faz sentido pra streaming ao vivo).
-
-## Pré-requisitos
-
-- **Windows / Linux / Mac** com Python 3.10+
-- **[go2rtc](https://github.com/AlexxIT/go2rtc/releases)** (binário standalone, 19MB)
-- **ffmpeg** no PATH (para transcode H.265 → H.264)
-- Câmera Yoosee/Xiongmai/Anyka acessível na rede local, com ONVIF ativado no app (`Configurações` → `Conexão NVR` → `Ativar a conexão`)
+Tudo em uma janela nativa. Sem terminal, sem servidor no navegador, sem depender de nuvem. Fecha a janela → mata tudo.
 
 ## Instalação
 
-```bash
-git clone https://github.com/joaosouz4dev/hawkeye-pi.git
-cd hawkeye-pi
+**Rápido:** baixe o instalador `.exe` ou `.msi` da [última Release](https://github.com/joaosouz4dev/hawkeye-pi/releases/latest) e execute.
+
+**Primeira execução:** o app abre uma tela pedindo IP e senha da câmera. Preencha uma vez.
+
+**Configuração:** salvos em `%LOCALAPPDATA%\hawkeye-pi\config.local.yaml`. Para trocar de câmera ou senha, edite esse arquivo e reabra o app.
+
+### ⚠️ Antivírus
+
+O `.exe` **não é assinado digitalmente** (certificado code-signing custa alguns centavos por ano e este projeto é gratuito). Alguns antivírus, especialmente **Kaspersky** e configurações agressivas de outros, podem quarentenar o executável ao rodar pela primeira vez. **Windows Defender padrão não bloqueia.**
+
+Se seu antivírus reclamar:
+- Verifique o SHA-256 do arquivo em [Releases](https://github.com/joaosouz4dev/hawkeye-pi/releases/latest)
+- Compare com o hash publicado no changelog da versão
+- Adicione uma exceção no seu antivírus para `%LOCALAPPDATA%\Programs\hawkeye-pi\`
+
+O código-fonte inteiro está aqui — você pode auditar exatamente o que o app faz.
+
+### Pré-requisitos da câmera
+
+- Câmera Yoosee/Xiongmai/Anyka (SoC AK3918 — várias marcas white-label)
+- ONVIF ativado no app oficial: `Configurações` → `Conexão NVR` → `Ativar a conexão`
+- Câmera na mesma rede local que o PC
+
+## Como funciona por dentro
+
+```
+┌──────────────────────────────────────────┐
+│           Janela do App (WebView2)       │
+│  ┌────────────────────────────────────┐  │
+│  │  UI (HTML/CSS/JS) - a interface    │  │
+│  │  que voce ja conhece               │  │
+│  └────────────────────────────────────┘  │
+│           │                              │
+│           │ localhost:PORTA_ALEATORIA    │
+│           ▼                              │
+│  ┌────────────────────────────────────┐  │
+│  │  Servidor HTTP local (Rust/axum)   │  │
+│  │  - /api/config, /api/setup         │  │
+│  │  - /move/<dir>, /stop  (ONVIF)     │  │
+│  │  - serve /ui/* estatico            │  │
+│  └────────────────────────────────────┘  │
+│           │                              │
+│           │ spawn (invisivel)            │
+│           ▼                              │
+│  ┌────────────────────────────────────┐  │
+│  │  go2rtc.exe (sidecar embutido)     │  │
+│  │  RTSP -> MSE/WebRTC                │  │
+│  └────────────────────────────────────┘  │
+└──────────────────────────────────────────┘
+           │              │
+           │ ONVIF        │ RTSP
+           ▼              ▼
+        ┌────────────────────┐
+        │   Câmera IP        │
+        └────────────────────┘
 ```
 
-**1. go2rtc** — baixe o binário e coloque na pasta do projeto. Copie `go2rtc.example.yaml` como `go2rtc.yaml` e edite as URLs RTSP com o IP e senha da sua câmera.
+- **App Tauri (Rust):** janela nativa Windows via WebView2 (Edge). Sem terminal, ícone próprio.
+- **Servidor local:** loopback em porta aleatória (invisível pra fora). Ninguém na rede consegue conectar.
+- **go2rtc:** empacotado dentro do `.exe`. Roda como sidecar invisível, morre quando o app fecha.
+- **Config:** `%LOCALAPPDATA%\hawkeye-pi\config.local.yaml`
 
-**2. ptz_control** — copie `config.example.yaml` como `config.local.yaml` e preencha com os dados da câmera:
+## O que NÃO tem (e por quê)
 
-```yaml
-cam_host: 192.168.1.100
-cam_user: admin
-cam_pass: sua_senha_onvif
-cam_label: Garagem
-```
+Testei exaustivamente, essas features não funcionam por limitação do **firmware** da câmera:
 
-**3. Rodar**
+- **Presets de posição** — `SetPreset`/`GotoPreset`/`AbsoluteMove`/`GetStatus` do ONVIF respondem `0 bytes`. Sem posição absoluta, presets seriam frágeis. Use presets pelo app oficial quando precisar.
+- **Microfone (falar pela câmera)** — RTSP `ANNOUNCE` retorna `405 Method Not Allowed` e ONVIF audio backchannel responde `0 bytes`. O firmware desabilita upload de áudio deliberadamente.
+- **Zoom óptico** — câmera "360" tem lente fixa; o "360" é o giro pan, não zoom.
 
-```bash
-./go2rtc.exe -c go2rtc.yaml
-python ptz_control.py
-```
+Essas ausências são limitações reais da câmera, não do projeto. Confirmadas por 5 projetos de referência (PTZ-YALL, PTZ-YCC365, yooseeptz, camera-hack, onvif-go).
 
-**4. Abrir** `http://localhost:1985` no navegador. Pronto.
+## Desenvolvimento
 
-## Instalar como app (PWA)
-
-**Desktop (Chrome/Edge):** com a página aberta, clique no ícone de instalar na barra de endereço (ou menu → "Instalar hawkeye-pi"). Vira um ícone no menu iniciar/dock.
-
-**Celular (Android/iOS):** menu do navegador → "Adicionar à tela inicial". Vira ícone na home, abre em tela cheia sem barra do navegador.
-
-## Iniciar com o sistema (Windows)
-
-Cria uma tarefa agendada que sobe no logon:
+Precisa de:
+- **Rust stable** (via [rustup](https://rustup.rs))
+- **MSVC Build Tools** (link.exe) — do Visual Studio Build Tools
+- **tauri-cli**: `cargo install tauri-cli --locked`
+- **go2rtc.exe** em `src-tauri/binaries/go2rtc-x86_64-pc-windows-msvc.exe` (já vem no repo)
 
 ```powershell
-$py = "C:\Users\SEU_USUARIO\AppData\Local\Programs\Python\Python312\pythonw.exe"
-$action = New-ScheduledTaskAction -Execute $py -Argument "C:\hawkeye-pi\ptz_control.py" -WorkingDirectory "C:\hawkeye-pi"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-Register-ScheduledTask -TaskName "hawkeye-pi" -Action $action -Trigger $trigger -Force
+# clone
+git clone https://github.com/joaosouz4dev/hawkeye-pi.git
+cd hawkeye-pi
+
+# rodar em modo dev (compila + abre janela com hot-reload)
+cd src-tauri
+cargo tauri dev
+
+# compilar release (gera .msi e .exe em src-tauri/target/release/bundle/)
+cargo tauri build
 ```
 
-Faça o mesmo para o go2rtc apontando para o `go2rtc.exe`.
+### Release automático
 
-## Descobrindo a URL RTSP da sua câmera
-
-Se você não sabe o caminho RTSP (varia por firmware), teste em ordem:
-
-- Yoosee/Xiongmai (Anyka): `rtsp://user:senha@IP:554/onvif1` (main) e `/onvif2` (sub) via **UDP**
-- Genérico H.264: `rtsp://user:senha@IP:554/stream1` ou `/h264` ou `/Streaming/Channels/101`
-- ffprobe para testar: `ffprobe -rtsp_transport udp rtsp://user:senha@IP:554/onvif1`
+`git tag v0.X.Y && git push --tags` dispara um workflow do GitHub Actions que compila em windows-latest e publica o `.msi` + `.exe` como Release.
 
 ## Segurança
 
-Este projeto expõe a interface **apenas em `localhost` (127.0.0.1)** por padrão. Se você quiser acesso remoto, **não** faça port-forward direto no roteador — use uma VPN (Tailscale, WireGuard) ou um reverse proxy com autenticação e HTTPS. A UI não tem login: quem alcançar a porta 1985 controla a câmera.
+- O app não abre portas na rede: o servidor HTTP interno escuta **só em `127.0.0.1`** com porta aleatória.
+- Config e credenciais ficam em `%LOCALAPPDATA%\hawkeye-pi\` (só o seu usuário Windows lê).
+- **Não** exponha a câmera diretamente na internet — se precisar acesso remoto, use VPN (Tailscale, WireGuard).
 
-## Créditos e referências
+## Créditos
 
-- [go2rtc](https://github.com/AlexxIT/go2rtc) por AlexxIT — o coração do streaming
-- [PTZ-YALL](https://github.com/carvalr/PTZ-YALL) e [yooseeptz](https://github.com/RICARDOKR/yooseeptz) — inspiração e confirmação das quirks do firmware Yoosee
-- [camera-hack](https://github.com/gabrielmaialva33/camera-hack) — engenharia reversa detalhada do SoC Anyka AK3918
+- [go2rtc](https://github.com/AlexxIT/go2rtc) por AlexxIT — o coração do streaming.
+- [Tauri](https://tauri.app) — framework nativo Windows/Linux/Mac em Rust.
+- [PTZ-YALL](https://github.com/carvalr/PTZ-YALL), [yooseeptz](https://github.com/RICARDOKR/yooseeptz), [camera-hack](https://github.com/gabrielmaialva33/camera-hack) — engenharia reversa do firmware Yoosee/Anyka.
 
 ## Licença
 
-MIT. Faz o que quiser, sem garantia.
+MIT. Ver [LICENSE](LICENSE).

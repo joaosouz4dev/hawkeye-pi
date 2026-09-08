@@ -1,157 +1,4 @@
-#!/usr/bin/env python3
-"""
-Controle PTZ web para camera Yoosee.
-
-Interface imersiva em http://localhost:1985:
- - Video edge-to-edge com overlays flutuantes
- - Auto-hide dos overlays apos 3s sem interacao (estilo Netflix)
- - D-pad compacto no canto inferior direito
- - Coluna de acoes a esquerda: snapshot, rec-clipe, fullscreen, som
- - Header com estado REAL do stream (LIVE / RECONECTANDO / OFFLINE) + latencia
- - Instant replay: buffer dos ultimos ~30s scrubbable
- - Responsivo: funciona bem em celular e desktop
-
-Nao tem microfone/backchannel: testado exaustivamente,
-o firmware nao aceita RTSP ANNOUNCE (405) nem ONVIF audio (0 bytes).
-"""
-import socket
-import hashlib
-import base64
-import os
-import json
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# ---- Config: carrega config.local.yaml (fora do git) ou usa defaults ----
-# O YAML e um subset simples (chave: valor por linha, strings sem aspas ou entre aspas).
-# Sem dependencia externa (pyyaml nao vem no stdlib).
-def _load_local_config():
-    path = os.path.join(BASE_DIR, "config.local.yaml")
-    cfg = {}
-    if not os.path.exists(path):
-        return cfg
-    try:
-        with open(path, encoding="utf-8") as f:
-            for raw in f:
-                line = raw.split("#", 1)[0].strip()
-                if not line or ":" not in line:
-                    continue
-                k, v = line.split(":", 1)
-                v = v.strip().strip('"').strip("'")
-                cfg[k.strip()] = v
-    except Exception as e:
-        print(f"[config.local.yaml] erro ao ler: {e}")
-    return cfg
-
-_cfg = _load_local_config()
-def _c(key, default):
-    return os.environ.get(key.upper(), _cfg.get(key, default))
-
-# ---- Config da camera (ONVIF) ----
-CAM_HOST = _c("cam_host", "192.168.1.100")   # trocar em config.local.yaml
-CAM_PORT = int(_c("cam_port", "5000"))
-CAM_USER = _c("cam_user", "admin")
-CAM_PASS = _c("cam_pass", "")                # SEM DEFAULT em codigo publico
-PROFILE  = _c("cam_profile", "IPCProfilesToken0")
-PTZ_PATH = "/onvif/ptz_service"
-
-# ---- Servidor web local ----
-LISTEN_PORT = int(_c("listen_port", "1985"))
-GO2RTC_URL  = _c("go2rtc_url", "http://localhost:1984")
-STREAM_NAME = _c("stream_name", "garagem_web")
-CAM_LABEL   = _c("cam_label", "Camera")
-
-if not CAM_PASS:
-    print("[AVISO] CAM_PASS vazio. Crie config.local.yaml a partir de config.example.yaml.")
-
-
-# ============================================================
-# ONVIF PTZ
-# ============================================================
-
-def _wss_header():
-    nonce = os.urandom(16)
-    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    digest = base64.b64encode(
-        hashlib.sha1(nonce + created.encode() + CAM_PASS.encode()).digest()
-    ).decode()
-    n64 = base64.b64encode(nonce).decode()
-    return (
-        '<s:Header><Security s:mustUnderstand="1" '
-        'xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
-        f'<UsernameToken><Username>{CAM_USER}</Username>'
-        '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
-        f'{digest}</Password>'
-        '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
-        f'{n64}</Nonce>'
-        '<Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
-        f'{created}</Created>'
-        '</UsernameToken></Security></s:Header>'
-    )
-
-
-def _soap(action, inner):
-    body = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
-        f'{_wss_header()}<s:Body>{inner}</s:Body></s:Envelope>'
-    )
-    req = (
-        f"POST {PTZ_PATH} HTTP/1.1\r\nHost: {CAM_HOST}:{CAM_PORT}\r\n"
-        f'Content-Type: application/soap+xml; charset=utf-8; action="{action}"\r\n'
-        f"Content-Length: {len(body.encode())}\r\nConnection: close\r\n\r\n{body}"
-    )
-    try:
-        s = socket.create_connection((CAM_HOST, CAM_PORT), timeout=6)
-        s.sendall(req.encode())
-        data = s.recv(2048)
-        s.close()
-        if not data:
-            return True, "OK (sem corpo)"
-        status = data.decode(errors="replace").split("\r\n")[0]
-        return status.endswith("200 OK"), status
-    except Exception as e:
-        return False, f"ERRO: {e}"
-
-
-def ptz_move(x, y):
-    ns = "http://www.onvif.org/ver20/ptz/wsdl"
-    sch = "http://www.onvif.org/ver10/schema"
-    inner = (
-        f'<ContinuousMove xmlns="{ns}"><ProfileToken>{PROFILE}</ProfileToken>'
-        f'<Velocity><PanTilt x="{x}" y="{y}" xmlns="{sch}"/></Velocity></ContinuousMove>'
-    )
-    return _soap(f"{ns}/ContinuousMove", inner)
-
-
-def ptz_stop():
-    ns = "http://www.onvif.org/ver20/ptz/wsdl"
-    inner = (
-        f'<Stop xmlns="{ns}"><ProfileToken>{PROFILE}</ProfileToken>'
-        f'<PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>'
-    )
-    return _soap(f"{ns}/Stop", inner)
-
-
-DIRECTIONS = {
-    "up":    (0.0,  0.6),
-    "down":  (0.0, -0.6),
-    "left":  (-0.6, 0.0),
-    "right": (0.6,  0.0),
-    "upleft":    (-0.6,  0.6),
-    "upright":   (0.6,   0.6),
-    "downleft":  (-0.6, -0.6),
-    "downright": (0.6,  -0.6),
-}
-
-
-# ============================================================
-# HTML da pagina (layout imersivo)
-# ============================================================
-
-PAGE = r"""<!doctype html>
+<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
@@ -161,7 +8,7 @@ PAGE = r"""<!doctype html>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<title>__LABEL__ — hawkeye-pi</title>
+<title>hawkeye-pi</title>
 <style>
   :root { color-scheme: dark; --safe-t: env(safe-area-inset-top, 0px);
           --safe-r: env(safe-area-inset-right, 0px);
@@ -249,6 +96,29 @@ PAGE = r"""<!doctype html>
            z-index:10; pointer-events:none; }
   #toast.show { opacity:1; }
 
+  /* --- tela de setup (first-run) --- */
+  #setup { position:fixed; inset:0; z-index:20; background:rgba(0,0,0,.85);
+           display:flex; align-items:center; justify-content:center; padding:20px; }
+  #setup[hidden] { display:none; }
+  .setup-card { background:#0f172a; border:1px solid #23262e; border-radius:14px;
+                padding:28px; width:min(96vw,440px); box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  .setup-card h2 { margin:0 0 6px; font-size:1.15rem; }
+  .setup-card p { color:#8b90a0; font-size:.85rem; line-height:1.5; margin:0 0 16px; }
+  .setup-card p code { background:#1c2129; padding:2px 6px; border-radius:4px; font-size:.75rem; }
+  .setup-card label { display:block; font-size:.78rem; color:#c7cbd6; margin-bottom:12px; }
+  .setup-card input { display:block; width:100%; margin-top:4px; padding:8px 10px;
+                      background:#0d0f13; border:1px solid #2b2f3a; border-radius:8px;
+                      color:#e7e9ee; font-size:.9rem; font-family:inherit; }
+  .setup-card input:focus { outline:none; border-color:#3b82f6; }
+  .setup-card details { font-size:.8rem; color:#8b90a0; margin-bottom:12px; cursor:pointer; }
+  .setup-card summary { padding:4px 0; }
+  .setup-card button[type=submit] { width:100%; padding:10px; margin-top:8px;
+                                      background:#3b82f6; color:#fff; border:none;
+                                      border-radius:8px; font-size:.9rem; font-weight:600;
+                                      cursor:pointer; }
+  .setup-card button[type=submit]:hover { background:#2563eb; }
+  .setup-card .setup-hint { font-size:.72rem; color:#6b7080; margin-top:12px; }
+
   /* Mobile: aumenta os botoes para o dedo */
   @media (max-width: 640px) {
     .actions button, .replay button { width:48px; height:48px; }
@@ -266,7 +136,7 @@ PAGE = r"""<!doctype html>
 
   <div class="overlay top">
     <span id="badge" class="badge"><span class="dot"></span><span id="badge-text">conectando</span></span>
-    <span class="cam-name">__LABEL__</span>
+    <span class="cam-name" id="cam-label">Camera</span>
     <span class="meta" id="meta"><span id="clock">--:--:--</span></span>
   </div>
 
@@ -307,13 +177,77 @@ PAGE = r"""<!doctype html>
 
   <div id="toast"></div>
 
+  <div id="setup" hidden>
+    <div class="setup-card">
+      <h2>Bem-vindo ao hawkeye-pi</h2>
+      <p>Preencha os dados da sua camera IP para começar. Você pode alterar isso depois em <code>%LOCALAPPDATA%\hawkeye-pi\config.local.yaml</code>.</p>
+      <form id="setup-form">
+        <label>Nome amigável <input name="cam_label" placeholder="Ex: Garagem" required></label>
+        <label>IP da câmera <input name="cam_host" placeholder="Ex: 192.168.1.100" required></label>
+        <label>Usuário ONVIF <input name="cam_user" value="admin" required></label>
+        <label>Senha ONVIF <input name="cam_pass" type="password" required></label>
+        <details>
+          <summary>Avançado</summary>
+          <label>Profile Token <input name="cam_profile" value="IPCProfilesToken0"></label>
+        </details>
+        <button type="submit">Salvar e conectar</button>
+        <p class="setup-hint">Certifique-se de ter ativado "Conexão NVR" no app Yoosee (Configurações → Conexão NVR → Ativar).</p>
+      </form>
+    </div>
+  </div>
+
 <script type="module">
 import './video-stream-muted.js';
 const player = document.getElementById('player');
-// MSE forcado: WebRTC nao expoe buffer/seekable (impede o instant replay)
-player.mode = 'mse';
-player.src = '__GO2RTC__/api/ws?src=__STREAM__';
 window.__player = player;
+
+// Boot: busca config do backend (Rust). Se first_run, mostra a tela de setup.
+async function boot() {
+  let cfg;
+  try {
+    cfg = await (await fetch('/api/config')).json();
+  } catch (e) {
+    cfg = { go2rtc: '', stream: 'main', label: 'Camera', first_run: true };
+  }
+  document.title = `${cfg.label} — hawkeye-pi`;
+  document.getElementById('cam-label').textContent = cfg.label;
+  window.__cfg = cfg;
+
+  if (cfg.first_run) {
+    document.getElementById('setup').hidden = false;
+    return;
+  }
+
+  player.mode = 'mse';
+  player.src = `${cfg.go2rtc}/api/ws?src=${cfg.stream}`;
+}
+boot();
+
+document.getElementById('setup-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Salvando...';
+  try {
+    const r = await fetch('/api/setup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      // recarrega para pegar go2rtc reconfigurado
+      setTimeout(() => location.reload(), 400);
+    } else {
+      btn.disabled = false; btn.textContent = 'Salvar e conectar';
+      alert('Falha ao salvar. Tente novamente.');
+    }
+  } catch (err) {
+    btn.disabled = false; btn.textContent = 'Salvar e conectar';
+    alert('Erro: ' + err.message);
+  }
+});
 </script>
 
 <script>
@@ -386,7 +320,8 @@ $('btn-snap').addEventListener('click', async ()=>{
   try {
     const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
     const a = document.createElement('a');
-    a.href = '__GO2RTC__/api/frame.jpeg?src=__STREAM__&_='+Date.now();
+    const c = window.__cfg || {go2rtc:'',stream:'garagem_web'};
+    a.href = `${c.go2rtc}/api/frame.jpeg?src=${c.stream}&_=${Date.now()}`;
     a.download = `garagem_${ts}.jpg`;
     document.body.appendChild(a); a.click(); a.remove();
     toast('foto baixada');
@@ -509,83 +444,3 @@ if ('serviceWorker' in navigator) {
 }
 </script>
 </body></html>
-"""
-
-
-# ============================================================
-# HTTP handler
-# ============================================================
-
-STATIC_FILES = {
-    "/video-stream-muted.js": ("video-stream-muted.js", "text/javascript; charset=utf-8"),
-    "/video-rtc.js":          ("video-rtc.js",          "text/javascript; charset=utf-8"),
-    "/manifest.webmanifest":  ("manifest.webmanifest",  "application/manifest+json; charset=utf-8"),
-    "/sw.js":                 ("sw.js",                 "text/javascript; charset=utf-8"),
-    "/icon-192.png":          ("icon-192.png",          "image/png"),
-    "/icon-512.png":          ("icon-512.png",          "image/png"),
-    "/icon-mask.png":         ("icon-mask.png",         "image/png"),
-    "/favicon.png":           ("favicon.png",           "image/png"),
-    "/favicon.ico":           ("favicon.png",           "image/png"),
-}
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, obj, code=200):
-        payload = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self):
-        path = self.path.split("?")[0]
-        if self.path == "/" or self.path.startswith("/index"):
-            html = (PAGE
-                .replace("__GO2RTC__", GO2RTC_URL)
-                .replace("__STREAM__", STREAM_NAME)
-                .replace("__LABEL__", CAM_LABEL)
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers()
-            self.wfile.write(html)
-        elif path in STATIC_FILES:
-            fname, mime = STATIC_FILES[path]
-            fpath = os.path.join(BASE_DIR, fname)
-            try:
-                with open(fpath, "rb") as f:
-                    body = f.read()
-            except OSError:
-                self.send_error(404); return
-            self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(body)))
-            # cache leve para assets estaticos, exceto sw.js (que precisa ser sempre fresco)
-            if fname != "sw.js":
-                self.send_header("Cache-Control", "public, max-age=3600")
-            else:
-                self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        p = self.path.strip("/").split("/")
-        if p[0] == "move" and len(p) == 2 and p[1] in DIRECTIONS:
-            x, y = DIRECTIONS[p[1]]
-            ok, st = ptz_move(x, y); self._json({"ok": ok, "status": st})
-        elif p[0] == "stop":
-            ok, st = ptz_stop(); self._json({"ok": ok, "status": st})
-        else:
-            self.send_error(404)
-
-    def log_message(self, *a): pass
-
-
-if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), Handler)
-    print(f"Controle PTZ em http://localhost:{LISTEN_PORT}")
-    srv.serve_forever()

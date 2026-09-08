@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "productName": "hawkeye-pi",
+  "version": "0.2.0",
+  "identifier": "dev.joaosouza.hawkeyepi",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "../ui",
+    "devUrl": "http://localhost:1985"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "hawkeye-pi",
+        "width": 1280,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 360,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "focus": true,
+        "visible": true,
+        "center": true,
+        "url": "index.html"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/go2rtc"
+    ],
+    "resources": [],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.png"
+      }
+    },
+    "category": "Utility",
+    "shortDescription": "Interface nativa para camera Yoosee/Xiongmai",
+    "longDescription": "Interface nativa Windows para camera IP Yoosee/Xiongmai via ONVIF + go2rtc, com streaming HD, PTZ, snapshot, gravacao de clipe e replay instantaneo. 100% local, sem depender da nuvem do fabricante."
+  }
+}

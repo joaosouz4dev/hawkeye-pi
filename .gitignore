@@ -1,4 +1,5 @@
-# Credenciais e config local
+# Credenciais e config local (vive em %LOCALAPPDATA% em runtime, mas
+# durante desenvolvimento pode ficar aqui)
 config.local.yaml
 go2rtc.yaml
 !go2rtc.example.yaml
@@ -7,11 +8,17 @@ go2rtc.yaml
 # Logs
 *.log
 
-# Python
+# Python (legado da v0.1)
 __pycache__/
 *.py[cod]
+ptz_control.py
 
-# Snapshots/gravacoes gerados
+# Rust
+/src-tauri/target/
+/src-tauri/gen/schemas/
+Cargo.lock
+
+# Runtime artifacts
 snapshots/
 recordings/
 presets/
