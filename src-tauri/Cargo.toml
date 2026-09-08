@@ -1,6 +1,6 @@
 [package]
 name = "hawkeye-pi"
-version = "0.2.1"
+version = "0.2.2"
 description = "Interface nativa para camera Yoosee via ONVIF + go2rtc"
 authors = ["João Victor Souza"]
 license = "MIT"

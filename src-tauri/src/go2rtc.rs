@@ -10,13 +10,15 @@ pub fn write_config(path: &Path, cfg: &Config, api_port: u16) -> std::io::Result
     // Se ainda nao tem credenciais (first-run), escreve config minima para o go2rtc
     // subir sem crashar - streams ficam vazios.
     let streams = if cfg.is_valid() {
+        // Transcode por SOFTWARE (sem #hardware): a saida do encoder NVENC
+        // sai com formato de pixel que o WebView2 renderiza como tela verde.
         format!(
             r#"streams:
   main:
     - "rtsp://{}:{}@{}:554/onvif1#rtptransport=udp"
-    - "ffmpeg:main#video=h264#hardware"
+    - "ffmpeg:main#video=h264"
   {}:
-    - "ffmpeg:main#video=h264#hardware"
+    - "ffmpeg:main#video=h264"
 "#,
             cfg.cam_user, cfg.cam_pass, cfg.cam_host, cfg.stream_name
         )
