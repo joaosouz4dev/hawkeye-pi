@@ -81,10 +81,23 @@ fn main() {
                 }
             });
 
-            // Aponta a janela para o servidor HTTP local (nao usa asset://)
+            // Aponta a janela para o servidor HTTP local (nao usa asset://).
+            // Espera o axum aceitar conexao antes de navegar, senao da "not found"/erro.
             let win = app.get_webview_window("main").expect("janela main");
             let url = format!("{}/", state_tauri.api_url);
-            win.eval(&format!("window.location.replace('{}');", url)).ok();
+            let addr = state_tauri
+                .api_url
+                .trim_start_matches("http://")
+                .to_string();
+            tauri::async_runtime::spawn(async move {
+                for _ in 0..100 {
+                    if std::net::TcpStream::connect(&addr).is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                let _ = win.eval(&format!("window.location.replace('{}');", url));
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

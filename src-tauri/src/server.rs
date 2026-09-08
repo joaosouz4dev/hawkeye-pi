@@ -111,44 +111,49 @@ async fn stop_ptz(State(s): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": ok }))
 }
 
-// ------------- servir arquivos estaticos do ui/ (embutidos ou disco) -------------
+// ------------- servir arquivos estaticos EMBUTIDOS no binario -------------
+//
+// Usamos include_bytes! em tempo de compilacao. O .exe fica auto-contido -
+// nao depende de nenhum arquivo no filesystem ao rodar.
+
+macro_rules! ui_asset {
+    ($name:expr) => { include_bytes!(concat!("../../ui/", $name)) };
+}
+
+fn get_asset(rel: &str) -> Option<&'static [u8]> {
+    match rel {
+        "index.html"             => Some(ui_asset!("index.html")),
+        "video-rtc.js"           => Some(ui_asset!("video-rtc.js")),
+        "video-stream-muted.js"  => Some(ui_asset!("video-stream-muted.js")),
+        "manifest.webmanifest"   => Some(ui_asset!("manifest.webmanifest")),
+        "sw.js"                  => Some(ui_asset!("sw.js")),
+        "favicon.png"            => Some(ui_asset!("favicon.png")),
+        "favicon.ico"            => Some(ui_asset!("favicon.png")),
+        "icon-192.png"           => Some(ui_asset!("icon-192.png")),
+        "icon-512.png"           => Some(ui_asset!("icon-512.png")),
+        "icon-mask.png"          => Some(ui_asset!("icon-mask.png")),
+        _ => None,
+    }
+}
 
 async fn serve_index() -> Response {
-    serve_file("index.html").await
+    serve_asset("index.html")
 }
 
 async fn serve_static(UrlPath(path): UrlPath<String>) -> Response {
-    serve_file(&path).await
+    serve_asset(&path)
 }
 
-async fn serve_file(rel: &str) -> Response {
-    // Em release, os arquivos ficam embutidos via include_bytes; em dev, lidos de disco.
-    // Aqui, versao simples: le de disco relativo ao exe (../ui).
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    // Tenta em ../ui (dev) e em resources/ui (release/nsis)
-    let candidates = [
-        base.join("../ui").join(rel),
-        base.join("ui").join(rel),
-        base.join("../../../ui").join(rel), // cargo target/debug
-        base.join("../../ui").join(rel),
-    ];
-
-    for p in candidates.iter() {
-        if let Ok(bytes) = tokio::fs::read(p).await {
-            let ct = guess_mime(rel);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, ct)
-                .body(Body::from(bytes))
-                .unwrap()
-                .into_response();
-        }
+fn serve_asset(rel: &str) -> Response {
+    if let Some(bytes) = get_asset(rel) {
+        let ct = guess_mime(rel);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(&bytes[..]))
+            .unwrap()
+            .into_response();
     }
-
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
